@@ -33,12 +33,60 @@ const TIERS = {
   disqualified: { label:"DISQ", color:"#4A5568", bg:"rgba(74,85,104,0.10)",  border:"rgba(74,85,104,0.3)" },
 };
 
+const OUTCOMES = {
+  converted:    { label:"Converted",    emoji:"🏆", color:"#22C55E", desc:"Deal signed or project started" },
+  meeting:      { label:"Meeting Set",  emoji:"📅", color:"#3B82F6", desc:"Meeting or call scheduled" },
+  responding:   { label:"Responding",   emoji:"💬", color:"#8B5CF6", desc:"Actively in conversation" },
+  pending:      { label:"Pending",      emoji:"⏳", color:"#F0A500", desc:"Outreach sent, waiting" },
+  ghosted:      { label:"Ghosted",      emoji:"👻", color:"#94A3B8", desc:"No response after follow-up" },
+  rejected:     { label:"Rejected",     emoji:"✗",  color:"#EF4444", desc:"Declined or not interested" },
+  bad_fit:      { label:"Bad Fit",      emoji:"⊘",  color:"#64748B", desc:"Wrong company type or too small" },
+};
+
+// ── PERSISTENT STORAGE ───────────────────────────────────────────────────────
+
+const STORE = {
+  get(key) {
+    try { const v = localStorage.getItem(`sol_${key}`); return v ? JSON.parse(v) : null; } catch { return null; }
+  },
+  set(key, val) {
+    try { localStorage.setItem(`sol_${key}`, JSON.stringify(val)); } catch {}
+  },
+  // Outcomes: { "CompanyName::country": { outcome, score, tier, sector, city, date, notes } }
+  getOutcomes()   { return this.get("outcomes") || {}; },
+  saveOutcome(id, data) {
+    const all = this.getOutcomes();
+    all[id] = { ...all[id], ...data, updated: new Date().toISOString() };
+    this.set("outcomes", all);
+  },
+  // Runs: [{ date, country, sectors, total, hot, warm, cool, disq }]
+  getRuns()       { return this.get("runs") || []; },
+  saveRun(run)    { const all = this.getRuns(); all.push({ ...run, date: new Date().toISOString() }); this.set("runs", all); },
+  // Custom calibration rules (evolved by Claude)
+  getCalibration(){ return this.get("calibration") || null; },
+  saveCalibration(c){ this.set("calibration", c); },
+  // Training log
+  getTrainLog()   { return this.get("trainlog") || []; },
+  saveTrainLog(e) { const all = this.getTrainLog(); all.push({ ...e, date: new Date().toISOString() }); this.set("trainlog", all); },
+};
+
+const prospectId = (name, country) => `${name}::${country}`;
+
 // ── PROMPTS ───────────────────────────────────────────────────────────────────
 
-const GEMINI_DISCOVER_PROMPT = (country, sectors, geo, minLoad) => {
+const GEMINI_DISCOVER_PROMPT = (country, sectors, geo, minLoad, outcomes) => {
   const cLabel = COUNTRIES.find(c=>c.value===country)?.label||country;
   const sLabels = sectors.map(s=>SECTORS.find(x=>x.value===s)?.label).filter(Boolean).join(", ");
   const loc = geo||COUNTRIES.find(c=>c.value===country)?.cities[0]||country;
+
+  // Build exclusion list from previously discovered companies in this country
+  const prevNames = Object.keys(outcomes)
+    .filter(k => k.endsWith(`::${country}`))
+    .map(k => k.split("::")[0]);
+  const exclusionBlock = prevNames.length > 0
+    ? `\nEXCLUDE these companies (already in pipeline): ${prevNames.join(", ")}`
+    : "";
+
   return `You are an expert business researcher finding African C&I solar energy prospects. Use Google Search to find REAL named companies.
 
 Find large commercial and industrial companies that are strong C&I solar candidates in:
@@ -56,14 +104,54 @@ STRICT RULES:
 - Only REAL companies with confirmed operations -- verifiable names and locations
 - Minimum ~100 employees or clearly large-scale industrial operation
 - EXCLUDE government utilities (ZESCO, UMEME, TANESCO, SNEL, ECG, KPLC) and NGOs
-- Maximum 10 results
+- Maximum 10 results${exclusionBlock}
 
 Return ONLY a valid JSON array. No markdown fences, no explanation.
 Schema: [{"name":"string","sector":"string","city":"string","region":"string","description":"operations and scale","energy_signals":"electricity pain evidence","website":"url or null","phone":"string or null","employees":"estimate","address":"string or null"}]`;
 };
 
+const buildHistoricalContext = (country) => {
+  const outcomes = STORE.getOutcomes();
+  const relevant = Object.entries(outcomes).filter(([k,v]) => {
+    return k.endsWith(`::${country}`) && v.outcome && v.outcome !== "pending";
+  });
+  if (relevant.length === 0) return "";
+
+  const positive = relevant.filter(([,v]) => ["converted","meeting","responding"].includes(v.outcome));
+  const negative = relevant.filter(([,v]) => ["ghosted","rejected","bad_fit"].includes(v.outcome));
+
+  let block = "\n\nHISTORICAL CALIBRATION DATA (use this to improve accuracy):\n";
+  if (positive.length > 0) {
+    block += "\nCompanies that CONVERTED or RESPONDED POSITIVELY (learn from these patterns):\n";
+    positive.forEach(([k,v]) => {
+      const name = k.split("::")[0];
+      block += `- ${name} | sector: ${v.sector||"?"} | city: ${v.city||"?"} | agent scored: ${v.score}/${v.tier} | actual outcome: ${v.outcome}${v.notes ? ` | notes: ${v.notes}` : ""}\n`;
+    });
+  }
+  if (negative.length > 0) {
+    block += "\nCompanies that were GHOSTED, REJECTED, or BAD FIT (avoid these patterns):\n";
+    negative.forEach(([k,v]) => {
+      const name = k.split("::")[0];
+      block += `- ${name} | sector: ${v.sector||"?"} | city: ${v.city||"?"} | agent scored: ${v.score}/${v.tier} | actual outcome: ${v.outcome}${v.notes ? ` | notes: ${v.notes}` : ""}\n`;
+    });
+  }
+  block += "\nAdjust your scoring to align with these real-world outcomes. Companies similar to positive outcomes should score higher. Companies similar to negative outcomes should score lower.\n";
+  return block;
+};
+
 const CLAUDE_QUALIFY_PROMPT = (co, country, minLoad) => {
   const cLabel = COUNTRIES.find(c=>c.value===country)?.label||country;
+  const calibration = STORE.getCalibration();
+  const historical = buildHistoricalContext(country);
+
+  const calibRules = calibration
+    ? `\nCALIBRATION RULES (learned from real outcomes):\n${calibration.rules}\n`
+    : `\nCALIBRATION RULES:
+- Zambia/DRC mining: score 75+ automatically
+- Hotels 100+ rooms: diesel score 8-10 (confirmed generators)
+- DRC all industrial: diesel score 7+ default
+- Government utilities: disqualify immediately (score 0)\n`;
+
   return `You are the world's foremost expert in C&I solar project development across Sub-Saharan Africa. Score this company as a solar prospect.
 
 Company: ${co.name}
@@ -83,13 +171,7 @@ SCORING (100 points total):
 - Creditworthiness (15pts): 13-15=listed/multinational, 7-12=established 5+ years
 - Diesel Dependency (10pts): 8-10=confirmed generator use
 - Decision-Maker Access (10pts): 8-10=named contact findable online
-
-CALIBRATION RULES:
-- Zambia/DRC mining: score 75+ automatically
-- Hotels 100+ rooms: diesel score 8-10 (confirmed generators)
-- DRC all industrial: diesel score 7+ default
-- Government utilities: disqualify immediately (score 0)
-
+${calibRules}${historical}
 Tiers: hot=75-100, warm=50-74, cool=25-49, disqualified=0-24
 
 Return ONLY valid JSON (no markdown):
@@ -124,10 +206,54 @@ Return ONLY valid JSON (no markdown):
 Rules: max 3 contacts, always flag WhatsApp when mobile found (African B2B context).`;
 };
 
+const CLAUDE_EVOLVE_PROMPT = (outcomes) => {
+  const entries = Object.entries(outcomes).filter(([,v]) => v.outcome && v.outcome !== "pending");
+  if (entries.length < 3) return null;
+
+  const data = entries.map(([k,v]) => {
+    const [name, country] = k.split("::");
+    return `- ${name} (${country}) | sector: ${v.sector||"?"} | city: ${v.city||"?"} | score: ${v.score}/100 | tier: ${v.tier} | ACTUAL: ${v.outcome}${v.notes ? ` | notes: ${v.notes}` : ""}`;
+  }).join("\n");
+
+  return `You are an expert at calibrating C&I solar prospect scoring systems for Sub-Saharan Africa.
+
+Below are REAL historical outcomes from Solarity Africa's pipeline. Each entry shows what the agent predicted (score/tier) and what actually happened (outcome).
+
+Outcome meanings:
+- converted = deal signed or project started (BEST)
+- meeting = meeting or call scheduled (GOOD)
+- responding = actively in conversation (GOOD)
+- ghosted = no response after follow-up (BAD prediction if scored high)
+- rejected = declined or not interested (BAD prediction if scored high)
+- bad_fit = wrong company type or too small (BAD prediction if scored high)
+
+HISTORICAL DATA:
+${data}
+
+ANALYSIS REQUIRED:
+1. Identify FALSE POSITIVES: companies scored HOT/WARM but had bad outcomes (ghosted/rejected/bad_fit)
+2. Identify FALSE NEGATIVES: companies scored COOL but had good outcomes (converted/meeting/responding)
+3. Find PATTERNS: what traits predict real success vs failure?
+
+Based on this analysis, write NEW calibration rules that would improve scoring accuracy.
+
+Return ONLY valid JSON (no markdown):
+{
+  "rules": "multi-line string with bullet-pointed calibration rules",
+  "analysis": "2-3 sentence summary of what changed and why",
+  "false_positives": integer count,
+  "false_negatives": integer count,
+  "accuracy_pct": integer (how many predictions matched outcomes),
+  "top_insight": "single most important finding",
+  "version": integer (increment from previous)
+}`;
+};
+
 // ── API CALLS ─────────────────────────────────────────────────────────────────
 
 async function geminiDiscover(apiKey, country, sectors, geo, minLoad) {
-  const prompt = GEMINI_DISCOVER_PROMPT(country, sectors, geo, minLoad);
+  const outcomes = STORE.getOutcomes();
+  const prompt = GEMINI_DISCOVER_PROMPT(country, sectors, geo, minLoad, outcomes);
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
     {
@@ -206,6 +332,32 @@ async function claudeEnrich(anthropicKey, co, country) {
   return JSON.parse(text);
 }
 
+async function claudeEvolve(anthropicKey) {
+  const outcomes = STORE.getOutcomes();
+  const prompt = CLAUDE_EVOLVE_PROMPT(outcomes);
+  if (!prompt) return null;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": anthropicKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 2000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!res.ok) throw new Error(`Claude API error ${res.status}`);
+  const data = await res.json();
+  let text = data.content.filter(b=>b.type==="text").map(b=>b.text).join("").trim();
+  if (text.includes("```json")) text = text.split("```json")[1].split("```")[0].trim();
+  else if (text.includes("```")) text = text.split("```")[1].split("```")[0].trim();
+  return JSON.parse(text);
+}
+
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
 const fmtCapex = (min,max) => {
@@ -215,6 +367,58 @@ const fmtCapex = (min,max) => {
 };
 
 const timeStr = () => new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+
+function computeMetrics() {
+  const outcomes = STORE.getOutcomes();
+  const entries = Object.entries(outcomes);
+  const rated = entries.filter(([,v]) => v.outcome && v.outcome !== "pending");
+  const total = rated.length;
+  if (total === 0) return null;
+
+  const positive = ["converted","meeting","responding"];
+  const negative = ["ghosted","rejected","bad_fit"];
+
+  let correct = 0, falsePos = 0, falseNeg = 0;
+  const bySector = {};
+  const byCountry = {};
+
+  rated.forEach(([k, v]) => {
+    const isGoodOutcome = positive.includes(v.outcome);
+    const isBadOutcome = negative.includes(v.outcome);
+    const wasHighScore = v.tier === "hot" || v.tier === "warm";
+
+    if ((wasHighScore && isGoodOutcome) || (!wasHighScore && isBadOutcome)) correct++;
+    if (wasHighScore && isBadOutcome) falsePos++;
+    if (!wasHighScore && isGoodOutcome) falseNeg++;
+
+    const sector = v.sector || "unknown";
+    if (!bySector[sector]) bySector[sector] = { total:0, correct:0 };
+    bySector[sector].total++;
+    if ((wasHighScore && isGoodOutcome) || (!wasHighScore && isBadOutcome)) bySector[sector].correct++;
+
+    const country = k.split("::")[1] || "unknown";
+    if (!byCountry[country]) byCountry[country] = { total:0, correct:0, converted:0 };
+    byCountry[country].total++;
+    if ((wasHighScore && isGoodOutcome) || (!wasHighScore && isBadOutcome)) byCountry[country].correct++;
+    if (v.outcome === "converted") byCountry[country].converted++;
+  });
+
+  const outcomeCounts = {};
+  rated.forEach(([,v]) => { outcomeCounts[v.outcome] = (outcomeCounts[v.outcome]||0) + 1; });
+
+  return {
+    total,
+    correct,
+    accuracy: total > 0 ? Math.round((correct/total)*100) : 0,
+    falsePos,
+    falseNeg,
+    outcomeCounts,
+    bySector,
+    byCountry,
+    runs: STORE.getRuns().length,
+    calibrationVersion: STORE.getCalibration()?.version || 0,
+  };
+}
 
 // ── SMALL UI PIECES ───────────────────────────────────────────────────────────
 
@@ -267,6 +471,82 @@ function MiniBar({ value, max }) {
   return (
     <div style={{height:3,background:"rgba(255,255,255,0.06)",borderRadius:2,overflow:"hidden"}}>
       <div style={{width:`${pct}%`,height:"100%",background:c,transition:"width 0.8s ease"}}/>
+    </div>
+  );
+}
+
+// ── OUTCOME TRACKER ───────────────────────────────────────────────────────────
+
+function OutcomeTracker({ prospectName, country, score, tier, sector, city }) {
+  const id = prospectId(prospectName, country);
+  const stored = STORE.getOutcomes()[id];
+  const [current, setCurrent] = useState(stored?.outcome || null);
+  const [notes, setNotes] = useState(stored?.notes || "");
+  const [showNotes, setShowNotes] = useState(false);
+
+  const save = (outcome) => {
+    setCurrent(outcome);
+    STORE.saveOutcome(id, { outcome, score, tier, sector, city, notes });
+  };
+
+  const saveNotes = () => {
+    STORE.saveOutcome(id, { outcome: current, score, tier, sector, city, notes });
+    setShowNotes(false);
+  };
+
+  return (
+    <div style={{
+      borderTop:"1px solid rgba(255,255,255,0.05)", paddingTop:12, marginTop:12,
+    }}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+        <div style={{fontSize:9,color:"#475569",letterSpacing:"0.12em",textTransform:"uppercase"}}>
+          Outcome Tracking
+        </div>
+        {current && (
+          <button onClick={()=>setShowNotes(v=>!v)} style={{
+            background:"none",border:"none",cursor:"pointer",fontSize:9,color:"#475569",
+          }}>
+            {showNotes ? "- hide notes" : "+ add notes"}
+          </button>
+        )}
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+        {Object.entries(OUTCOMES).map(([key, o]) => {
+          const active = current === key;
+          return (
+            <button key={key} onClick={() => save(key)} style={{
+              padding:"4px 10px", borderRadius:5, cursor:"pointer", fontSize:10,
+              display:"flex", alignItems:"center", gap:4,
+              background: active ? `${o.color}20` : "rgba(255,255,255,0.02)",
+              border: active ? `1px solid ${o.color}60` : "1px solid rgba(255,255,255,0.06)",
+              color: active ? o.color : "#3D4F63",
+              fontWeight: active ? 600 : 400,
+              transition:"all 0.15s",
+            }}>
+              <span>{o.emoji}</span>
+              <span>{o.label}</span>
+            </button>
+          );
+        })}
+      </div>
+      {showNotes && (
+        <div style={{marginTop:8,display:"flex",gap:6}}>
+          <input
+            value={notes} onChange={e => setNotes(e.target.value)}
+            placeholder="Why this outcome? (optional but helps training)"
+            style={{
+              flex:1, background:"rgba(0,0,0,0.3)", border:"1px solid rgba(255,255,255,0.08)",
+              borderRadius:6, padding:"7px 10px", color:"#94A3B8", fontSize:11,
+              outline:"none", fontFamily:"'JetBrains Mono',monospace",
+            }}
+          />
+          <button onClick={saveNotes} style={{
+            padding:"7px 14px", borderRadius:6, cursor:"pointer",
+            background:"rgba(240,165,0,0.1)", border:"1px solid rgba(240,165,0,0.3)",
+            color:"#F0A500", fontSize:10, fontWeight:600,
+          }}>Save</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -332,12 +612,13 @@ function ContactCard({ c }) {
 
 // ── PROSPECT CARD ─────────────────────────────────────────────────────────────
 
-function ProspectCard({ p, idx, onEnrich }) {
+function ProspectCard({ p, idx, onEnrich, country }) {
   const [open, setOpen] = useState(false);
   const [showFactors, setShowFactors] = useState(false);
   const q = p.qual||{};
   const t = TIERS[q.tier]||TIERS.cool;
   const capex = fmtCapex(q.capex_min, q.capex_max);
+  const storedOutcome = STORE.getOutcomes()[prospectId(p.co.name, country)];
 
   return (
     <div style={{
@@ -368,6 +649,10 @@ function ProspectCard({ p, idx, onEnrich }) {
             )}
             {p.enriching&&(
               <Pill label="searching..." color="#F0A500"/>
+            )}
+            {storedOutcome?.outcome && (
+              <Pill label={OUTCOMES[storedOutcome.outcome]?.label || storedOutcome.outcome}
+                    color={OUTCOMES[storedOutcome.outcome]?.color || "#94A3B8"} />
             )}
           </div>
           <div style={{fontSize:11,color:"#475569"}}>
@@ -478,6 +763,10 @@ function ProspectCard({ p, idx, onEnrich }) {
                   {p.co.description&&<div style={{fontSize:11,color:"#475569",lineHeight:1.6,marginTop:6}}>{p.co.description}</div>}
                 </div>
               )}
+
+              {/* OUTCOME TRACKING */}
+              <OutcomeTracker prospectName={p.co.name} country={country}
+                score={q.score} tier={q.tier} sector={p.co.sector} city={p.co.city} />
             </div>
 
             {/* Right -- contacts */}
@@ -522,6 +811,214 @@ function ProspectCard({ p, idx, onEnrich }) {
   );
 }
 
+// ── LEARNING DASHBOARD ────────────────────────────────────────────────────────
+
+function LearningDashboard({ onTrain, training }) {
+  const [metrics, setMetrics] = useState(computeMetrics());
+  const calibration = STORE.getCalibration();
+  const trainLog = STORE.getTrainLog();
+  const outcomes = STORE.getOutcomes();
+  const ratedCount = Object.values(outcomes).filter(v => v.outcome && v.outcome !== "pending").length;
+  const totalCount = Object.keys(outcomes).length;
+
+  useEffect(() => {
+    const interval = setInterval(() => setMetrics(computeMetrics()), 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const canTrain = ratedCount >= 3;
+
+  const statBox = (label, value, color, sub) => (
+    <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:8,padding:"14px 16px"}}>
+      <div style={{fontSize:28,fontWeight:700,color,fontFamily:"'Syne',sans-serif",lineHeight:1}}>{value}</div>
+      <div style={{fontSize:8,color:"#334155",letterSpacing:"0.12em",textTransform:"uppercase",marginTop:4}}>{label}</div>
+      {sub && <div style={{fontSize:10,color:"#475569",marginTop:4}}>{sub}</div>}
+    </div>
+  );
+
+  return (
+    <div style={{padding:"20px",overflowY:"auto",height:"100%"}}>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24}}>
+        <div>
+          <div style={{fontSize:8,color:"#F0A50060",letterSpacing:"0.2em",textTransform:"uppercase",marginBottom:4}}>LEARNING ENGINE</div>
+          <div style={{fontSize:18,fontWeight:700,color:"#E2E8F0",fontFamily:"'Syne',sans-serif"}}>Agent Intelligence</div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {calibration && (
+            <Pill label={`v${calibration.version} trained`} color="#22C55E" />
+          )}
+          <Pill label={`${ratedCount} rated`} color="#38BDF8" />
+        </div>
+      </div>
+
+      {/* How it works */}
+      {ratedCount < 3 && (
+        <div style={{
+          background:"rgba(240,165,0,0.04)", border:"1px solid rgba(240,165,0,0.15)",
+          borderRadius:10, padding:"18px 20px", marginBottom:20,
+        }}>
+          <div style={{fontSize:12,color:"#F0A500",fontWeight:700,marginBottom:8}}>How the learning engine works</div>
+          <div style={{fontSize:11,color:"#94A3B8",lineHeight:1.8}}>
+            <span style={{color:"#F0A500"}}>Step 1:</span> Run pipelines to discover and score prospects.<br/>
+            <span style={{color:"#38BDF8"}}>Step 2:</span> Mark real outcomes on each prospect card (Converted, Meeting Set, Ghosted, etc.)<br/>
+            <span style={{color:"#22C55E"}}>Step 3:</span> Once you have 3+ rated outcomes, click "Train Agent" below.<br/>
+            <span style={{color:"#A78BFA"}}>Step 4:</span> Claude analyzes your real results and rewrites the scoring rules. Every future pipeline run uses these improved rules plus your historical outcomes as calibration data.
+          </div>
+          <div style={{fontSize:10,color:"#475569",marginTop:10}}>
+            You have rated {ratedCount} out of {totalCount} prospects. {ratedCount < 3 ? `Rate ${3 - ratedCount} more to unlock training.` : "Ready to train."}
+          </div>
+        </div>
+      )}
+
+      {/* Stats grid */}
+      {metrics && (
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:20}}>
+          {statBox("Accuracy", `${metrics.accuracy}%`, metrics.accuracy>=70?"#22C55E":metrics.accuracy>=50?"#F0A500":"#EF4444",
+            `${metrics.correct}/${metrics.total} correct`)}
+          {statBox("False Positives", metrics.falsePos, "#EF4444", "Scored high, bad outcome")}
+          {statBox("False Negatives", metrics.falseNeg, "#38BDF8", "Scored low, good outcome")}
+          {statBox("Pipeline Runs", metrics.runs, "#A78BFA", `Calibration v${metrics.calibrationVersion}`)}
+        </div>
+      )}
+
+      {/* Outcome breakdown */}
+      {metrics && metrics.total > 0 && (
+        <div style={{background:"rgba(0,0,0,0.2)",borderRadius:10,padding:"16px 18px",marginBottom:20}}>
+          <div style={{fontSize:9,color:"#334155",letterSpacing:"0.12em",textTransform:"uppercase",marginBottom:12}}>Outcome Distribution</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:12}}>
+            {Object.entries(metrics.outcomeCounts).map(([k,v]) => {
+              const o = OUTCOMES[k];
+              return (
+                <div key={k} style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span style={{fontSize:14}}>{o?.emoji||"?"}</span>
+                  <span style={{fontSize:12,color:o?.color||"#94A3B8",fontWeight:700}}>{v}</span>
+                  <span style={{fontSize:10,color:"#475569"}}>{o?.label||k}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Country breakdown */}
+      {metrics && Object.keys(metrics.byCountry).length > 0 && (
+        <div style={{background:"rgba(0,0,0,0.2)",borderRadius:10,padding:"16px 18px",marginBottom:20}}>
+          <div style={{fontSize:9,color:"#334155",letterSpacing:"0.12em",textTransform:"uppercase",marginBottom:12}}>By Country</div>
+          {Object.entries(metrics.byCountry).map(([k,v]) => {
+            const acc = v.total > 0 ? Math.round((v.correct/v.total)*100) : 0;
+            const country = COUNTRIES.find(c=>c.value===k);
+            return (
+              <div key={k} style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+                <span style={{fontSize:14}}>{country?.flag||"🌍"}</span>
+                <span style={{fontSize:11,color:"#E2E8F0",fontWeight:600,width:80}}>{country?.label||k}</span>
+                <div style={{flex:1,height:4,background:"rgba(255,255,255,0.06)",borderRadius:2,overflow:"hidden"}}>
+                  <div style={{width:`${acc}%`,height:"100%",background:acc>=70?"#22C55E":acc>=50?"#F0A500":"#EF4444",transition:"width 0.5s"}}/>
+                </div>
+                <span style={{fontSize:10,color:"#7BA5C8",fontWeight:700,width:40,textAlign:"right"}}>{acc}%</span>
+                <span style={{fontSize:9,color:"#334155"}}>{v.total} rated, {v.converted} converted</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Train button */}
+      <div style={{
+        background:"rgba(0,0,0,0.15)",borderRadius:10,padding:"20px",marginBottom:20,
+        border: canTrain ? "1px solid rgba(240,165,0,0.2)" : "1px solid rgba(255,255,255,0.05)",
+      }}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:700,color:canTrain?"#E2E8F0":"#334155"}}>
+              Train Agent
+            </div>
+            <div style={{fontSize:10,color:"#475569",marginTop:4}}>
+              Claude will analyze your {ratedCount} rated outcomes and rewrite the scoring calibration rules.
+              {calibration ? ` Currently on v${calibration.version}.` : " No training yet."}
+            </div>
+          </div>
+          <button onClick={onTrain} disabled={!canTrain || training} style={{
+            padding:"10px 24px",borderRadius:8,cursor:canTrain&&!training?"pointer":"default",
+            background:canTrain&&!training?"linear-gradient(135deg,#F0A500 0%,#D4601A 100%)":"rgba(255,255,255,0.03)",
+            border:"none",color:canTrain&&!training?"#070B12":"#1E293B",
+            fontSize:11,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",
+            boxShadow:canTrain&&!training?"0 4px 16px rgba(240,165,0,0.2)":"none",
+            opacity:canTrain?1:0.4,
+          }}>
+            {training ? <span className="pulse">TRAINING...</span> : "🧠 Train Now"}
+          </button>
+        </div>
+
+        {!canTrain && (
+          <div style={{fontSize:10,color:"#F0A50060",marginTop:8}}>
+            Rate at least 3 prospect outcomes to unlock training. You have {ratedCount} so far.
+          </div>
+        )}
+      </div>
+
+      {/* Current calibration */}
+      {calibration && (
+        <div style={{background:"rgba(34,197,94,0.04)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:10,padding:"16px 18px",marginBottom:20}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+            <div style={{fontSize:9,color:"#22C55E60",letterSpacing:"0.12em",textTransform:"uppercase"}}>Active Calibration v{calibration.version}</div>
+            <div style={{fontSize:9,color:"#334155"}}>{calibration.accuracy_pct ? `${calibration.accuracy_pct}% accuracy` : ""}</div>
+          </div>
+          {calibration.top_insight && (
+            <div style={{fontSize:12,color:"#22C55E",fontWeight:600,marginBottom:8}}>
+              💡 {calibration.top_insight}
+            </div>
+          )}
+          {calibration.analysis && (
+            <div style={{fontSize:11,color:"#94A3B8",lineHeight:1.6,marginBottom:10}}>{calibration.analysis}</div>
+          )}
+          <div style={{fontSize:10,color:"#475569",whiteSpace:"pre-wrap",lineHeight:1.6,
+            background:"rgba(0,0,0,0.2)",borderRadius:6,padding:"10px 12px",maxHeight:200,overflowY:"auto"}}>
+            {calibration.rules}
+          </div>
+        </div>
+      )}
+
+      {/* Training history */}
+      {trainLog.length > 0 && (
+        <div style={{background:"rgba(0,0,0,0.2)",borderRadius:10,padding:"16px 18px"}}>
+          <div style={{fontSize:9,color:"#334155",letterSpacing:"0.12em",textTransform:"uppercase",marginBottom:10}}>Training History</div>
+          {trainLog.slice().reverse().map((e,i) => (
+            <div key={i} style={{
+              display:"flex",alignItems:"center",gap:10,marginBottom:6,
+              padding:"6px 8px",borderRadius:6,background:i===0?"rgba(34,197,94,0.04)":"transparent",
+            }}>
+              <span style={{fontSize:10,color:"#334155",fontFamily:"'JetBrains Mono',monospace"}}>
+                {new Date(e.date).toLocaleDateString()}
+              </span>
+              <span style={{fontSize:10,color:"#22C55E",fontWeight:600}}>v{e.version}</span>
+              <span style={{fontSize:10,color:"#475569",flex:1}}>{e.analysis?.slice(0,80)}...</span>
+              <span style={{fontSize:9,color:e.accuracy_pct>=70?"#22C55E":"#F0A500"}}>{e.accuracy_pct}%</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Reset */}
+      <div style={{marginTop:20,textAlign:"center"}}>
+        <button onClick={() => {
+          if (confirm("This will delete all learning data including outcomes, training history, and calibration rules. Are you sure?")) {
+            localStorage.removeItem("sol_outcomes");
+            localStorage.removeItem("sol_runs");
+            localStorage.removeItem("sol_calibration");
+            localStorage.removeItem("sol_trainlog");
+            setMetrics(null);
+          }
+        }} style={{
+          background:"none",border:"none",cursor:"pointer",fontSize:9,color:"#1E293B",letterSpacing:"0.08em",
+        }}>
+          ↩ Reset all learning data
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── PIPELINE LOG ──────────────────────────────────────────────────────────────
 
 function PipelineLog({ entries }) {
@@ -550,7 +1047,11 @@ function SetupScreen({ onSave }) {
   const [antKey, setAntKey] = useState("");
   const [showGem, setShowGem] = useState(false);
   const [showAnt, setShowAnt] = useState(false);
-  const [testing, setTesting] = useState({ gemini: null, claude: null }); // null | "loading" | "ok" | string(error)
+  const [testing, setTesting] = useState({ gemini: null, claude: null });
+
+  const outcomes = STORE.getOutcomes();
+  const ratedCount = Object.values(outcomes).filter(v => v.outcome && v.outcome !== "pending").length;
+  const calibration = STORE.getCalibration();
 
   async function testGemini() {
     if (!gemKey.trim()) return;
@@ -558,21 +1059,12 @@ function SetupScreen({ onSave }) {
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${gemKey.trim()}`,
-        {
-          method:"POST",
-          headers:{"Content-Type":"application/json"},
+        { method:"POST", headers:{"Content-Type":"application/json"},
           body:JSON.stringify({contents:[{role:"user",parts:[{text:"Reply with just the word: CONNECTED"}]}]}),
         }
       );
-      if (res.ok) {
-        setTesting(p => ({...p, gemini: "ok"}));
-      } else {
-        const d = await res.json().catch(()=>({}));
-        setTesting(p => ({...p, gemini: d?.error?.message||"Invalid API key"}));
-      }
-    } catch(e) {
-      setTesting(p => ({...p, gemini: "Connection error - check key and try again"}));
-    }
+      setTesting(p => ({...p, gemini: res.ok ? "ok" : ((await res.json().catch(()=>({}))).error?.message || "Invalid API key")}));
+    } catch(e) { setTesting(p => ({...p, gemini: "Connection error"})); }
   }
 
   async function testClaude() {
@@ -581,224 +1073,130 @@ function SetupScreen({ onSave }) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method:"POST",
-        headers:{
-          "Content-Type":"application/json",
-          "x-api-key": antKey.trim(),
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
-        body:JSON.stringify({
-          model:"claude-sonnet-4-20250514",
-          max_tokens:50,
-          messages:[{role:"user",content:"Reply with just the word: CONNECTED"}],
-        }),
+        headers:{"Content-Type":"application/json","x-api-key":antKey.trim(),"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:50,messages:[{role:"user",content:"Reply with just: CONNECTED"}]}),
       });
-      if (res.ok) {
-        setTesting(p => ({...p, claude: "ok"}));
-      } else {
-        const d = await res.json().catch(()=>({}));
-        setTesting(p => ({...p, claude: d?.error?.message||"Invalid API key"}));
-      }
-    } catch(e) {
-      setTesting(p => ({...p, claude: "Connection error - check key and try again"}));
-    }
+      setTesting(p => ({...p, claude: res.ok ? "ok" : ((await res.json().catch(()=>({}))).error?.message || "Invalid API key")}));
+    } catch(e) { setTesting(p => ({...p, claude: "Connection error"})); }
   }
 
   const bothReady = gemKey.trim() && antKey.trim();
-  const bothVerified = testing.gemini === "ok" && testing.claude === "ok";
 
   const inputStyle = (result) => ({
     width:"100%",background:"rgba(0,0,0,0.3)",
     border:`1px solid ${result==="ok"?"rgba(34,197,94,0.4)":result&&result!=="ok"&&result!=="loading"?"rgba(239,68,68,0.4)":"rgba(255,255,255,0.08)"}`,
     borderRadius:8,padding:"12px 44px 12px 14px",
-    color:"#E2E8F0",fontSize:13,fontFamily:"'JetBrains Mono',monospace",
-    outline:"none",transition:"border-color 0.2s",
+    color:"#E2E8F0",fontSize:13,fontFamily:"'JetBrains Mono',monospace",outline:"none",transition:"border-color 0.2s",
   });
-
-  const resultMsg = (result) => {
-    if (!result || result === "loading") return null;
-    return (
-      <div style={{
-        marginTop:8,fontSize:11,
-        color:result==="ok"?"#22C55E":"#EF4444",
-        display:"flex",alignItems:"center",gap:6,
-      }}>
-        {result==="ok"?"✓ Connected successfully":"✗ "+result}
-      </div>
-    );
-  };
 
   return (
     <div style={{
       minHeight:"100vh",background:"linear-gradient(135deg,#070B12 0%,#0D1520 100%)",
-      display:"flex",alignItems:"center",justifyContent:"center",
-      fontFamily:"'JetBrains Mono',monospace",
+      display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'JetBrains Mono',monospace",
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
         *{box-sizing:border-box;margin:0;padding:0;}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}.pulse{animation:pulse 1.4s ease-in-out infinite;}
         @keyframes glow{0%,100%{opacity:0.4}50%{opacity:0.8}}.glow{animation:glow 3s ease-in-out infinite;}
-        ::-webkit-scrollbar{width:3px;height:3px;}
-        ::-webkit-scrollbar-thumb{background:#1E2D3D;border-radius:2px;}
+        ::-webkit-scrollbar{width:3px;height:3px;}::-webkit-scrollbar-thumb{background:#1E2D3D;border-radius:2px;}
       `}</style>
-
-      {/* Background grid */}
       <div style={{position:"fixed",inset:0,pointerEvents:"none",overflow:"hidden"}}>
-        <div style={{
-          position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",
-          width:600,height:600,borderRadius:"50%",
-          background:"radial-gradient(circle,rgba(240,165,0,0.04) 0%,transparent 70%)",
-        }}/>
+        <div style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",width:600,height:600,borderRadius:"50%",
+          background:"radial-gradient(circle,rgba(240,165,0,0.04) 0%,transparent 70%)"}}/>
         <svg style={{position:"absolute",inset:0,width:"100%",height:"100%",opacity:0.03}}>
-          <defs>
-            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-              <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#F0A500" strokeWidth="0.5"/>
-            </pattern>
-          </defs>
-          <rect width="100%" height="100%" fill="url(#grid)"/>
-        </svg>
+          <defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#F0A500" strokeWidth="0.5"/></pattern></defs>
+          <rect width="100%" height="100%" fill="url(#grid)"/></svg>
       </div>
-
       <div style={{width:"100%",maxWidth:500,padding:"0 20px",position:"relative",zIndex:1}}>
-        {/* Logo */}
         <div style={{textAlign:"center",marginBottom:40}}>
-          <div style={{
-            width:64,height:64,borderRadius:"50%",margin:"0 auto 20px",
-            background:"rgba(240,165,0,0.1)",border:"1px solid rgba(240,165,0,0.2)",
-            display:"flex",alignItems:"center",justifyContent:"center",fontSize:28,
-          }} className="glow">☀️</div>
-          <div style={{
-            fontFamily:"'Syne',sans-serif",fontSize:28,fontWeight:800,
+          <div style={{width:64,height:64,borderRadius:"50%",margin:"0 auto 20px",background:"rgba(240,165,0,0.1)",border:"1px solid rgba(240,165,0,0.2)",
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:28}} className="glow">☀️</div>
+          <div style={{fontFamily:"'Syne',sans-serif",fontSize:28,fontWeight:800,
             background:"linear-gradient(135deg,#E2E8F0 0%,#F0A500 60%,#FF5C20 100%)",
-            WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",
-            marginBottom:8,lineHeight:1.1,
-          }}>Solarity Africa</div>
+            WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",marginBottom:8,lineHeight:1.1}}>Solarity Africa</div>
           <div style={{fontFamily:"'Syne',sans-serif",fontSize:13,color:"#F0A50080",letterSpacing:"0.2em",textTransform:"uppercase"}}>
-            Solar Origination Agent
-          </div>
-          <div style={{fontSize:11,color:"#334155",marginTop:10}}>
-            Discovery · Qualification · Contact Enrichment
+            Self-Learning Solar Origination Agent
           </div>
         </div>
 
-        {/* Keys card */}
-        <div style={{
-          background:"rgba(13,21,32,0.8)",backdropFilter:"blur(20px)",
-          border:"1px solid rgba(255,255,255,0.08)",borderRadius:16,padding:"32px",
-        }}>
-          {/* Gemini Key */}
+        {/* Learning status badge */}
+        {(ratedCount > 0 || calibration) && (
+          <div style={{display:"flex",justifyContent:"center",gap:8,marginBottom:20}}>
+            {ratedCount > 0 && <Pill label={`${ratedCount} outcomes tracked`} color="#38BDF8"/>}
+            {calibration && <Pill label={`Calibration v${calibration.version}`} color="#22C55E"/>}
+          </div>
+        )}
+
+        <div style={{background:"rgba(13,21,32,0.8)",backdropFilter:"blur(20px)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:16,padding:"32px"}}>
+          {/* Gemini */}
           <div style={{marginBottom:24}}>
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
               <div style={{width:6,height:6,borderRadius:"50%",background:testing.gemini==="ok"?"#22C55E":"#F0A500"}}/>
-              <div style={{fontSize:11,color:"#F0A500",letterSpacing:"0.12em",textTransform:"uppercase"}}>
-                Gemini API Key
-              </div>
-            </div>
-            <div style={{fontSize:10,color:"#475569",lineHeight:1.6,marginBottom:10}}>
-              Discovery engine with Google Search grounding.{" "}
-              <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" style={{color:"#38BDF8",textDecoration:"none"}}>Get key →</a>
+              <div style={{fontSize:11,color:"#F0A500",letterSpacing:"0.12em",textTransform:"uppercase"}}>Gemini API Key</div>
             </div>
             <div style={{display:"flex",gap:8}}>
               <div style={{position:"relative",flex:1}}>
-                <input
-                  type={showGem?"text":"password"}
-                  value={gemKey}
-                  onChange={e=>{ setGemKey(e.target.value); setTesting(p=>({...p,gemini:null})); }}
-                  placeholder="AIza..."
-                  style={inputStyle(testing.gemini)}
-                />
-                <button onClick={()=>setShowGem(v=>!v)} style={{
-                  position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",
-                  background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:14,
-                }}>{showGem?"🙈":"👁"}</button>
+                <input type={showGem?"text":"password"} value={gemKey}
+                  onChange={e=>{setGemKey(e.target.value);setTesting(p=>({...p,gemini:null}));}}
+                  placeholder="AIza..." style={inputStyle(testing.gemini)}/>
+                <button onClick={()=>setShowGem(v=>!v)} style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",
+                  background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:14}}>{showGem?"🙈":"👁"}</button>
               </div>
-              <button onClick={testGemini} disabled={!gemKey.trim()||testing.gemini==="loading"}
-                style={{
-                  padding:"0 16px",borderRadius:8,cursor:!gemKey.trim()||testing.gemini==="loading"?"default":"pointer",
-                  background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",
-                  color:!gemKey.trim()?"#1E293B":"#7BA5C8",fontSize:10,fontWeight:600,letterSpacing:"0.06em",
-                  whiteSpace:"nowrap",
-                }}>
-                {testing.gemini==="loading"?<span className="pulse">...</span>:"TEST"}
-              </button>
+              <button onClick={testGemini} disabled={!gemKey.trim()||testing.gemini==="loading"} style={{
+                padding:"0 16px",borderRadius:8,cursor:!gemKey.trim()?"default":"pointer",background:"rgba(255,255,255,0.04)",
+                border:"1px solid rgba(255,255,255,0.08)",color:!gemKey.trim()?"#1E293B":"#7BA5C8",fontSize:10,fontWeight:600}}>
+                {testing.gemini==="loading"?<span className="pulse">...</span>:"TEST"}</button>
             </div>
-            {resultMsg(testing.gemini)}
+            {testing.gemini && testing.gemini !== "loading" && (
+              <div style={{marginTop:8,fontSize:11,color:testing.gemini==="ok"?"#22C55E":"#EF4444"}}>
+                {testing.gemini==="ok"?"✓ Connected":"✗ "+testing.gemini}</div>
+            )}
           </div>
 
-          {/* Claude Key */}
+          {/* Claude */}
           <div style={{marginBottom:24}}>
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
               <div style={{width:6,height:6,borderRadius:"50%",background:testing.claude==="ok"?"#22C55E":"#38BDF8"}}/>
-              <div style={{fontSize:11,color:"#38BDF8",letterSpacing:"0.12em",textTransform:"uppercase"}}>
-                Anthropic API Key
-              </div>
-            </div>
-            <div style={{fontSize:10,color:"#475569",lineHeight:1.6,marginBottom:10}}>
-              Qualification scoring and contact enrichment.{" "}
-              <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" style={{color:"#38BDF8",textDecoration:"none"}}>Get key →</a>
+              <div style={{fontSize:11,color:"#38BDF8",letterSpacing:"0.12em",textTransform:"uppercase"}}>Anthropic API Key</div>
             </div>
             <div style={{display:"flex",gap:8}}>
               <div style={{position:"relative",flex:1}}>
-                <input
-                  type={showAnt?"text":"password"}
-                  value={antKey}
-                  onChange={e=>{ setAntKey(e.target.value); setTesting(p=>({...p,claude:null})); }}
-                  placeholder="sk-ant-..."
-                  style={inputStyle(testing.claude)}
-                />
-                <button onClick={()=>setShowAnt(v=>!v)} style={{
-                  position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",
-                  background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:14,
-                }}>{showAnt?"🙈":"👁"}</button>
+                <input type={showAnt?"text":"password"} value={antKey}
+                  onChange={e=>{setAntKey(e.target.value);setTesting(p=>({...p,claude:null}));}}
+                  placeholder="sk-ant-..." style={inputStyle(testing.claude)}/>
+                <button onClick={()=>setShowAnt(v=>!v)} style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",
+                  background:"none",border:"none",cursor:"pointer",color:"#475569",fontSize:14}}>{showAnt?"🙈":"👁"}</button>
               </div>
-              <button onClick={testClaude} disabled={!antKey.trim()||testing.claude==="loading"}
-                style={{
-                  padding:"0 16px",borderRadius:8,cursor:!antKey.trim()||testing.claude==="loading"?"default":"pointer",
-                  background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",
-                  color:!antKey.trim()?"#1E293B":"#7BA5C8",fontSize:10,fontWeight:600,letterSpacing:"0.06em",
-                  whiteSpace:"nowrap",
-                }}>
-                {testing.claude==="loading"?<span className="pulse">...</span>:"TEST"}
-              </button>
+              <button onClick={testClaude} disabled={!antKey.trim()||testing.claude==="loading"} style={{
+                padding:"0 16px",borderRadius:8,cursor:!antKey.trim()?"default":"pointer",background:"rgba(255,255,255,0.04)",
+                border:"1px solid rgba(255,255,255,0.08)",color:!antKey.trim()?"#1E293B":"#7BA5C8",fontSize:10,fontWeight:600}}>
+                {testing.claude==="loading"?<span className="pulse">...</span>:"TEST"}</button>
             </div>
-            {resultMsg(testing.claude)}
+            {testing.claude && testing.claude !== "loading" && (
+              <div style={{marginTop:8,fontSize:11,color:testing.claude==="ok"?"#22C55E":"#EF4444"}}>
+                {testing.claude==="ok"?"✓ Connected":"✗ "+testing.claude}</div>
+            )}
           </div>
 
-          {/* Launch */}
-          <button
-            onClick={()=>{ if(bothReady) onSave(gemKey.trim(), antKey.trim()); }}
-            disabled={!bothReady}
-            style={{
-              width:"100%",padding:"13px",borderRadius:8,cursor:bothReady?"pointer":"default",
-              background:bothReady?"linear-gradient(135deg,#F0A500 0%,#D4601A 100%)":"rgba(255,255,255,0.03)",
-              border:"none",color:bothReady?"#070B12":"#1E293B",
-              fontSize:12,fontFamily:"'JetBrains Mono',monospace",fontWeight:700,
-              letterSpacing:"0.1em",textTransform:"uppercase",
-              boxShadow:bothReady?"0 4px 20px rgba(240,165,0,0.25)":"none",
-              transition:"all 0.2s",opacity:bothReady?1:0.4,
-            }}>
+          <button onClick={()=>{if(bothReady) onSave(gemKey.trim(),antKey.trim());}} disabled={!bothReady} style={{
+            width:"100%",padding:"13px",borderRadius:8,cursor:bothReady?"pointer":"default",
+            background:bothReady?"linear-gradient(135deg,#F0A500 0%,#D4601A 100%)":"rgba(255,255,255,0.03)",
+            border:"none",color:bothReady?"#070B12":"#1E293B",fontSize:12,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",
+            boxShadow:bothReady?"0 4px 20px rgba(240,165,0,0.25)":"none",opacity:bothReady?1:0.4}}>
             ⚡ Launch Agent
           </button>
 
-          {bothReady && !bothVerified && (
-            <div style={{textAlign:"center",marginTop:10,fontSize:10,color:"#F0A50060"}}>
-              Tip: test both keys before launching to avoid errors mid-pipeline
-            </div>
-          )}
-
           <div style={{marginTop:20,padding:"12px",background:"rgba(0,0,0,0.2)",borderRadius:8}}>
-            <div style={{fontSize:9,color:"#334155",letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:6}}>How it works</div>
+            <div style={{fontSize:9,color:"#334155",letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:6}}>Self-learning pipeline</div>
             <div style={{fontSize:10,color:"#475569",lineHeight:1.7}}>
-              <span style={{color:"#F0A500"}}>① Gemini</span> uses Google Search to discover real companies<br/>
-              <span style={{color:"#38BDF8"}}>② Claude</span> scores each company across 6 solar criteria<br/>
-              <span style={{color:"#22C55E"}}>③ Claude</span> finds decision-maker contacts for Hot + Warm prospects
+              <span style={{color:"#F0A500"}}>① Discover</span> real companies via Google Search<br/>
+              <span style={{color:"#38BDF8"}}>② Score</span> across 6 solar criteria {calibration ? "(using trained rules)" : ""}<br/>
+              <span style={{color:"#22C55E"}}>③ Enrich</span> contacts for Hot + Warm prospects<br/>
+              <span style={{color:"#A78BFA"}}>④ Learn</span> from your outcome ratings to improve future runs
             </div>
           </div>
-        </div>
-
-        <div style={{textAlign:"center",marginTop:16,fontSize:10,color:"#1E293B"}}>
-          API keys are used only in this browser session and never stored server-side.
         </div>
       </div>
     </div>
@@ -820,11 +1218,17 @@ export default function SolarityAgent() {
   const [stats, setStats] = useState(null);
   const [filter, setFilter] = useState("all");
   const [tab, setTab] = useState("results");
+  const [training, setTraining] = useState(false);
   const running = screen === "running";
 
   const log = useCallback((msg, t="def") => {
     setLogEntries(p=>[...p,{msg,t,ts:timeStr()}]);
   },[]);
+
+  // Count learning data for sidebar
+  const outcomes = STORE.getOutcomes();
+  const ratedCount = Object.values(outcomes).filter(v => v.outcome && v.outcome !== "pending").length;
+  const calibration = STORE.getCalibration();
 
   if (!keys.gemini || !keys.anthropic) {
     return <SetupScreen onSave={(g,a)=>setKeys({gemini:g,anthropic:a})}/>;
@@ -839,6 +1243,10 @@ export default function SolarityAgent() {
     setTab("log");
     setProgress({phase:"discovery",cur:0,tot:0});
 
+    const histCount = Object.values(STORE.getOutcomes()).filter(v=>v.outcome&&v.outcome!=="pending").length;
+    if (histCount > 0) log(`Loading ${histCount} historical outcomes for calibration`, "info");
+    if (STORE.getCalibration()) log(`Using trained calibration v${STORE.getCalibration().version}`, "info");
+
     try {
       log(`Discovery: ${COUNTRIES.find(c=>c.value===cfg.country)?.label} · ${cfg.sectors.join(", ")}${cfg.geo?` · ${cfg.geo}`:""}`, "info");
       log("Gemini searching with Google grounding...", "info");
@@ -850,16 +1258,14 @@ export default function SolarityAgent() {
       } catch(e) {
         log(`Discovery error: ${e.message}`, "err");
         if (e.message.includes("400")||e.message.includes("API_KEY")) {
-          log("Check your Gemini API key - it may be invalid or expired", "err");
-          setScreen("results");
-          return;
+          log("Check your Gemini API key", "err");
+          setScreen("results"); return;
         }
       }
 
       if (!companies.length) {
         log("No candidates found - try different sectors or location", "err");
-        setScreen("results");
-        return;
+        setScreen("results"); return;
       }
 
       setProgress({phase:"qualification",cur:0,tot:companies.length});
@@ -875,6 +1281,11 @@ export default function SolarityAgent() {
         try {
           const q = await claudeQualify(keys.anthropic, co, cfg.country, cfg.minLoad);
           pList.push({co, qual:q, contacts:[], enriching:false});
+          // Save to outcomes store as "pending"
+          const id = prospectId(co.name, cfg.country);
+          if (!STORE.getOutcomes()[id]) {
+            STORE.saveOutcome(id, { outcome:"pending", score:q.score, tier:q.tier, sector:co.sector, city:co.city });
+          }
           if      (q.tier==="hot")  { hot++;  log(`${co.name} → HOT (${q.score})`,  "ok"); }
           else if (q.tier==="warm") { warm++; log(`${co.name} → WARM (${q.score})`, "ok"); }
           else if (q.tier==="cool") { cool++; log(`${co.name} → COOL (${q.score})`); }
@@ -886,6 +1297,7 @@ export default function SolarityAgent() {
       const sorted = [...pList].sort((a,b)=>b.qual.score-a.qual.score);
       setProspects(sorted);
       setStats({total:pList.length,hot,warm,cool,disq});
+      STORE.saveRun({country:cfg.country, sectors:cfg.sectors, total:pList.length, hot, warm, cool, disq});
       log(`✓ Qualification complete - HOT:${hot}  WARM:${warm}  COOL:${cool}  DISQ:${disq}`, "ok");
 
       if (cfg.autoEnrich) {
@@ -915,7 +1327,6 @@ export default function SolarityAgent() {
       log("Pipeline complete ✓", "ok");
       setTab("results");
     } catch(e) { log(`Pipeline error: ${e.message}`, "err"); }
-
     setScreen("results");
   }
 
@@ -933,9 +1344,30 @@ export default function SolarityAgent() {
     }
   }
 
+  async function trainAgent() {
+    setTraining(true);
+    log("Training: analyzing historical outcomes...", "info");
+    try {
+      const result = await claudeEvolve(keys.anthropic);
+      if (result) {
+        STORE.saveCalibration(result);
+        STORE.saveTrainLog(result);
+        log(`✓ Training complete - v${result.version} | ${result.accuracy_pct}% accuracy | FP:${result.false_positives} FN:${result.false_negatives}`, "ok");
+        log(`Insight: ${result.top_insight}`, "info");
+      } else {
+        log("Not enough rated outcomes to train (need 3+)", "err");
+      }
+    } catch(e) {
+      log(`Training failed: ${e.message}`, "err");
+    }
+    setTraining(false);
+  }
+
   function doExport() {
     const out = {
       generated:new Date().toISOString(), config:cfg, stats,
+      calibration: STORE.getCalibration(),
+      outcomes: STORE.getOutcomes(),
       prospects:prospects.map(p=>({
         name:p.co.name, city:p.co.city, sector:p.co.sector,
         score:p.qual?.score, tier:p.qual?.tier,
@@ -944,8 +1376,7 @@ export default function SolarityAgent() {
         summary:p.qual?.summary, green_flags:p.qual?.green_flags,
         red_flags:p.qual?.red_flags, ipp:p.qual?.ipp,
         next_action:p.qual?.next_action,
-        website:p.co.website, phone:p.co.phone,
-        contacts:p.contacts,
+        website:p.co.website, phone:p.co.phone, contacts:p.contacts,
       })),
     };
     const a = document.createElement("a");
@@ -960,8 +1391,7 @@ export default function SolarityAgent() {
   const CSS = `
     @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
     *{box-sizing:border-box;margin:0;padding:0;}
-    ::-webkit-scrollbar{width:4px;height:4px;}
-    ::-webkit-scrollbar-thumb{background:#1E2D3D;border-radius:2px;}
+    ::-webkit-scrollbar{width:4px;height:4px;}::-webkit-scrollbar-thumb{background:#1E2D3D;border-radius:2px;}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.25}}.pulse{animation:pulse 1.3s ease-in-out infinite;}
     @keyframes spin{to{transform:rotate(360deg)}}.spin{animation:spin 0.9s linear infinite;display:inline-block;}
     @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}.fu{animation:fadeUp 0.3s ease forwards;}
@@ -972,20 +1402,19 @@ export default function SolarityAgent() {
     <div style={{display:"flex",height:"100vh",background:"#080D14",fontFamily:"'JetBrains Mono',monospace",color:"#E2E8F0",overflow:"hidden"}}>
       <style>{CSS}</style>
 
-      {/* ── SIDEBAR ─────────────────────────────────────────────────── */}
-      <div style={{
-        width:220,flexShrink:0,background:"#060A10",
-        borderRight:"1px solid rgba(255,255,255,0.06)",
-        display:"flex",flexDirection:"column",height:"100vh",overflow:"hidden",
-      }}>
+      {/* ── SIDEBAR ── */}
+      <div style={{width:220,flexShrink:0,background:"#060A10",borderRight:"1px solid rgba(255,255,255,0.06)",
+        display:"flex",flexDirection:"column",height:"100vh",overflow:"hidden"}}>
         <div style={{padding:"20px 16px 16px",borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
-          <div style={{fontSize:8,color:"#F0A50050",letterSpacing:"0.3em",textTransform:"uppercase",marginBottom:6}}>
-            SOLARITY AFRICA
-          </div>
+          <div style={{fontSize:8,color:"#F0A50050",letterSpacing:"0.3em",textTransform:"uppercase",marginBottom:6}}>SOLARITY AFRICA</div>
           <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,lineHeight:1.1,
-            background:"linear-gradient(135deg,#E2E8F0 0%,#F0A500 100%)",
-            WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>
+            background:"linear-gradient(135deg,#E2E8F0 0%,#F0A500 100%)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>
             Origination<br/>Agent
+          </div>
+          {/* Learning badge */}
+          <div style={{display:"flex",gap:4,marginTop:8,flexWrap:"wrap"}}>
+            {calibration && <Pill label={`v${calibration.version}`} color="#22C55E"/>}
+            {ratedCount > 0 && <Pill label={`${ratedCount} rated`} color="#38BDF8"/>}
           </div>
         </div>
 
@@ -1007,70 +1436,50 @@ export default function SolarityAgent() {
           <div style={{marginBottom:16}}>
             <div style={{fontSize:8,color:"#1E293B",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>Country</div>
             {COUNTRIES.map(c=>(
-              <button key={c.value} onClick={()=>!running&&setCfg(p=>({...p,country:c.value,geo:""}))}
-                disabled={running}
-                style={{
-                  display:"flex",alignItems:"center",gap:7,width:"100%",
-                  padding:"5px 8px",borderRadius:5,cursor:running?"default":"pointer",
+              <button key={c.value} onClick={()=>!running&&setCfg(p=>({...p,country:c.value,geo:""}))} disabled={running}
+                style={{display:"flex",alignItems:"center",gap:7,width:"100%",padding:"5px 8px",borderRadius:5,
+                  cursor:running?"default":"pointer",
                   background:cfg.country===c.value?"rgba(240,165,0,0.1)":"transparent",
                   border:cfg.country===c.value?"1px solid rgba(240,165,0,0.3)":"1px solid transparent",
-                  color:cfg.country===c.value?"#F0A500":"#3D4F63",
-                  fontSize:11,marginBottom:1,textAlign:"left",
-                  opacity:running&&cfg.country!==c.value?0.25:1,
-                  transition:"all 0.15s",
-                }}>
-                <span>{c.flag}</span>
-                <span style={{fontWeight:cfg.country===c.value?600:400}}>{c.label}</span>
+                  color:cfg.country===c.value?"#F0A500":"#3D4F63",fontSize:11,marginBottom:1,textAlign:"left",
+                  opacity:running&&cfg.country!==c.value?0.25:1,transition:"all 0.15s"}}>
+                <span>{c.flag}</span><span style={{fontWeight:cfg.country===c.value?600:400}}>{c.label}</span>
               </button>
             ))}
           </div>
-
           <div style={{marginBottom:16}}>
             <div style={{fontSize:8,color:"#1E293B",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>Region</div>
             {["",...(countryD?.cities||[])].map(city=>(
-              <button key={city||"all"} onClick={()=>!running&&setCfg(p=>({...p,geo:city}))}
-                disabled={running}
-                style={{
-                  display:"block",width:"100%",padding:"4px 8px",borderRadius:5,
-                  cursor:running?"default":"pointer",textAlign:"left",fontSize:10,
+              <button key={city||"all"} onClick={()=>!running&&setCfg(p=>({...p,geo:city}))} disabled={running}
+                style={{display:"block",width:"100%",padding:"4px 8px",borderRadius:5,cursor:running?"default":"pointer",textAlign:"left",fontSize:10,
                   background:cfg.geo===city?"rgba(240,165,0,0.08)":"transparent",
                   border:cfg.geo===city?"1px solid rgba(240,165,0,0.2)":"1px solid transparent",
-                  color:cfg.geo===city?"#F0A500":"#2D3F52",marginBottom:1,
-                  opacity:running&&cfg.geo!==city?0.25:1,
-                }}>
+                  color:cfg.geo===city?"#F0A500":"#2D3F52",marginBottom:1,opacity:running&&cfg.geo!==city?0.25:1}}>
                 {city||"All regions"}
               </button>
             ))}
           </div>
-
           <div style={{marginBottom:16}}>
             <div style={{fontSize:8,color:"#1E293B",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>Min Load</div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
               {[100,200,500,1000].map(v=>(
-                <button key={v} onClick={()=>!running&&setCfg(p=>({...p,minLoad:v}))}
-                  disabled={running}
-                  style={{
-                    padding:"6px 4px",borderRadius:5,cursor:running?"default":"pointer",fontSize:10,textAlign:"center",
+                <button key={v} onClick={()=>!running&&setCfg(p=>({...p,minLoad:v}))} disabled={running}
+                  style={{padding:"6px 4px",borderRadius:5,cursor:running?"default":"pointer",fontSize:10,textAlign:"center",
                     background:cfg.minLoad===v?"rgba(240,165,0,0.12)":"rgba(255,255,255,0.02)",
                     border:cfg.minLoad===v?"1px solid rgba(240,165,0,0.35)":"1px solid rgba(255,255,255,0.05)",
-                    color:cfg.minLoad===v?"#F0A500":"#2D3F52",
-                  }}>
+                    color:cfg.minLoad===v?"#F0A500":"#2D3F52"}}>
                   {v>=1000?"1 MWp":`${v} kWp`}
                 </button>
               ))}
             </div>
           </div>
-
           <div style={{marginBottom:16}}>
-            <div style={{fontSize:8,color:"#1E293B",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>Auto-Enrich Contacts</div>
-            <button onClick={()=>!running&&setCfg(p=>({...p,autoEnrich:!p.autoEnrich}))}
-              disabled={running}
-              style={{
-                width:"100%",padding:"7px",borderRadius:6,cursor:running?"default":"pointer",fontSize:10,
+            <div style={{fontSize:8,color:"#1E293B",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>Auto-Enrich</div>
+            <button onClick={()=>!running&&setCfg(p=>({...p,autoEnrich:!p.autoEnrich}))} disabled={running}
+              style={{width:"100%",padding:"7px",borderRadius:6,cursor:running?"default":"pointer",fontSize:10,
                 background:cfg.autoEnrich?"rgba(34,197,94,0.08)":"rgba(255,255,255,0.02)",
                 border:cfg.autoEnrich?"1px solid rgba(34,197,94,0.25)":"1px solid rgba(255,255,255,0.05)",
-                color:cfg.autoEnrich?"#22C55E":"#2D3F52",fontWeight:cfg.autoEnrich?600:400,
-              }}>
+                color:cfg.autoEnrich?"#22C55E":"#2D3F52",fontWeight:cfg.autoEnrich?600:400}}>
               {cfg.autoEnrich?"✓ Hot + Warm":"Disabled"}
             </button>
           </div>
@@ -1078,106 +1487,70 @@ export default function SolarityAgent() {
 
         <div style={{padding:"12px 16px",borderTop:"1px solid rgba(255,255,255,0.05)"}}>
           <button onClick={runPipeline} disabled={running||cfg.sectors.length===0}
-            style={{
-              width:"100%",padding:"12px",borderRadius:8,
-              cursor:running||cfg.sectors.length===0?"default":"pointer",
+            style={{width:"100%",padding:"12px",borderRadius:8,cursor:running||cfg.sectors.length===0?"default":"pointer",
               background:running?"rgba(240,165,0,0.06)":cfg.sectors.length===0?"rgba(255,255,255,0.03)":"linear-gradient(135deg,#F0A500 0%,#D4601A 100%)",
               border:running?"1px solid rgba(240,165,0,0.15)":"none",
               color:running?"#F0A50060":cfg.sectors.length===0?"#1E293B":"#070B12",
               fontSize:11,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",
-              boxShadow:running||cfg.sectors.length===0?"none":"0 4px 16px rgba(240,165,0,0.22)",
-              transition:"all 0.2s",
-            }}>
-            {running?(
-              <span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
-                <span className="spin" style={{fontSize:11}}>◌</span>RUNNING
-              </span>
-            ):"⚡ Run Pipeline"}
+              boxShadow:running||cfg.sectors.length===0?"none":"0 4px 16px rgba(240,165,0,0.22)",transition:"all 0.2s"}}>
+            {running?(<span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              <span className="spin" style={{fontSize:11}}>◌</span>RUNNING</span>):"⚡ Run Pipeline"}
           </button>
-          {cfg.sectors.length===0&&(
-            <div style={{fontSize:9,color:"#EF4444",textAlign:"center",marginTop:6,letterSpacing:"0.06em"}}>
-              Select at least one sector
-            </div>
-          )}
           <button onClick={()=>setKeys({gemini:null,anthropic:null})}
-            style={{
-              width:"100%",marginTop:8,padding:"6px",borderRadius:6,cursor:"pointer",
-              background:"none",border:"none",color:"#1E293B",fontSize:9,letterSpacing:"0.08em",
-            }}>
+            style={{width:"100%",marginTop:8,padding:"6px",borderRadius:6,cursor:"pointer",
+              background:"none",border:"none",color:"#1E293B",fontSize:9,letterSpacing:"0.08em"}}>
             ↩ Change API Keys
           </button>
         </div>
       </div>
 
-      {/* ── MAIN AREA ────────────────────────────────────────────────── */}
+      {/* ── MAIN AREA ── */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-
-        <div style={{
-          padding:"12px 20px",borderBottom:"1px solid rgba(255,255,255,0.05)",
-          display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,
-          background:"rgba(6,10,16,0.8)",
-        }}>
+        <div style={{padding:"12px 20px",borderBottom:"1px solid rgba(255,255,255,0.05)",
+          display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,background:"rgba(6,10,16,0.8)"}}>
           <div style={{display:"flex",alignItems:"center",gap:14}}>
             <div style={{fontSize:9,color:"#1E293B",letterSpacing:"0.15em"}}>
-              {countryD?.flag} {countryD?.label?.toUpperCase()}
-              {cfg.geo?`  ·  ${cfg.geo.toUpperCase()}`:""}
-              {`  ·  MIN ${cfg.minLoad} kWp`}
+              {countryD?.flag} {countryD?.label?.toUpperCase()}{cfg.geo?`  ·  ${cfg.geo.toUpperCase()}`:""}{`  ·  MIN ${cfg.minLoad} kWp`}
             </div>
             {running&&(
-              <div style={{
-                display:"flex",alignItems:"center",gap:7,
-                background:"rgba(240,165,0,0.07)",borderRadius:4,padding:"3px 10px",
-                border:"1px solid rgba(240,165,0,0.15)",
-              }}>
+              <div style={{display:"flex",alignItems:"center",gap:7,background:"rgba(240,165,0,0.07)",borderRadius:4,padding:"3px 10px",
+                border:"1px solid rgba(240,165,0,0.15)"}}>
                 <span className="spin" style={{fontSize:10,color:"#F0A500"}}>◌</span>
                 <span style={{fontSize:9,color:"#F0A500",letterSpacing:"0.1em"}}>
-                  {progress.phase.toUpperCase()}
-                  {progress.tot>0?`  ${progress.cur}/${progress.tot}`:""}
-                </span>
+                  {progress.phase.toUpperCase()}{progress.tot>0?`  ${progress.cur}/${progress.tot}`:""}</span>
               </div>
             )}
           </div>
           {prospects.length>0&&(
-            <button onClick={doExport} style={{
-              padding:"5px 12px",borderRadius:5,cursor:"pointer",
+            <button onClick={doExport} style={{padding:"5px 12px",borderRadius:5,cursor:"pointer",
               background:"rgba(56,189,248,0.08)",border:"1px solid rgba(56,189,248,0.2)",
-              color:"#38BDF8",fontSize:9,fontWeight:600,letterSpacing:"0.1em",
-            }}>↓ Export JSON</button>
+              color:"#38BDF8",fontSize:9,fontWeight:600,letterSpacing:"0.1em"}}>↓ Export JSON</button>
           )}
         </div>
 
-        <div style={{
-          padding:"12px 20px",borderBottom:"1px solid rgba(255,255,255,0.05)",
-          flexShrink:0,
-        }}>
-          <div style={{fontSize:8,color:"#1E293B",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>
-            Sectors - Select one or more
-          </div>
+        {/* Sectors */}
+        <div style={{padding:"12px 20px",borderBottom:"1px solid rgba(255,255,255,0.05)",flexShrink:0}}>
+          <div style={{fontSize:8,color:"#1E293B",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>Sectors</div>
           <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
             {SECTORS.map(s=>{
               const on = cfg.sectors.includes(s.value);
               return (
-                <button key={s.value}
-                  onClick={()=>!running&&setCfg(p=>({
-                    ...p,sectors:on?p.sectors.filter(x=>x!==s.value):[...p.sectors,s.value]
-                  }))}
-                  style={{
-                    display:"flex",alignItems:"center",gap:6,padding:"5px 11px",
-                    borderRadius:5,cursor:running?"default":"pointer",fontSize:11,
-                    background:on?"rgba(240,165,0,0.1)":"rgba(255,255,255,0.025)",
-                    border:on?"1px solid rgba(240,165,0,0.35)":"1px solid rgba(255,255,255,0.055)",
-                    color:on?"#F0A500":"#3D4F63",fontWeight:on?600:400,
-                    opacity:running&&!on?0.3:1,transition:"all 0.15s",
-                  }}>
-                  <span style={{fontSize:14}}>{s.icon}</span>
-                  <span>{s.label}</span>
-                  <span style={{fontSize:8,color:on?"#F0A50050":"#1E293B",letterSpacing:"0.04em"}}>{s.bench}</span>
+                <button key={s.value} onClick={()=>!running&&setCfg(p=>({
+                  ...p,sectors:on?p.sectors.filter(x=>x!==s.value):[...p.sectors,s.value]
+                }))} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 11px",borderRadius:5,
+                  cursor:running?"default":"pointer",fontSize:11,
+                  background:on?"rgba(240,165,0,0.1)":"rgba(255,255,255,0.025)",
+                  border:on?"1px solid rgba(240,165,0,0.35)":"1px solid rgba(255,255,255,0.055)",
+                  color:on?"#F0A500":"#3D4F63",fontWeight:on?600:400,opacity:running&&!on?0.3:1,transition:"all 0.15s"}}>
+                  <span style={{fontSize:14}}>{s.icon}</span><span>{s.label}</span>
+                  <span style={{fontSize:8,color:on?"#F0A50050":"#1E293B"}}>{s.bench}</span>
                 </button>
               );
             })}
           </div>
         </div>
 
+        {/* Progress */}
         {running&&(
           <div style={{padding:"10px 20px",borderBottom:"1px solid rgba(255,255,255,0.04)",flexShrink:0}}>
             <div style={{display:"flex",alignItems:"center",gap:8}}>
@@ -1193,8 +1566,7 @@ export default function SolarityAgent() {
                       {active&&<div style={{width:`${pct}%`,height:"100%",background:"#F0A500",transition:"width 0.3s"}}/>}
                     </div>
                     <span style={{fontSize:8,color:done||active?"#F0A500":"#1E293B",letterSpacing:"0.1em",whiteSpace:"nowrap",textTransform:"uppercase"}}>
-                      {ph}{active&&progress.tot>0?` ${progress.cur}/${progress.tot}`:""}
-                    </span>
+                      {ph}{active&&progress.tot>0?` ${progress.cur}/${progress.tot}`:""}</span>
                   </div>
                 );
               })}
@@ -1202,23 +1574,21 @@ export default function SolarityAgent() {
           </div>
         )}
 
-        <div style={{
-          display:"flex",borderBottom:"1px solid rgba(255,255,255,0.05)",
-          flexShrink:0,background:"rgba(6,10,16,0.5)",
-        }}>
+        {/* Tabs */}
+        <div style={{display:"flex",borderBottom:"1px solid rgba(255,255,255,0.05)",flexShrink:0,background:"rgba(6,10,16,0.5)"}}>
           {[
             {key:"results",label:`Prospects${prospects.length?` (${prospects.length})`:""}`},
+            {key:"learning",label:`Learning${ratedCount?` (${ratedCount})`:""}`},
             {key:"log",label:`Log${logEntries.length?` (${logEntries.length})`:""}`},
           ].map(t=>(
             <button key={t.key} onClick={()=>setTab(t.key)} style={{
               padding:"9px 18px",cursor:"pointer",fontSize:9,letterSpacing:"0.12em",textTransform:"uppercase",
               background:"none",border:"none",
               borderBottom:tab===t.key?"2px solid #F0A500":"2px solid transparent",
-              color:tab===t.key?"#F0A500":"#2D3F52",
-              fontWeight:tab===t.key?600:400,marginBottom:-1,
-            }}>{t.label}</button>
+              color:tab===t.key?"#F0A500":"#2D3F52",fontWeight:tab===t.key?600:400,marginBottom:-1}}>
+              {t.key==="learning"?"🧠 ":""}{t.label}
+            </button>
           ))}
-
           {tab==="results"&&prospects.length>0&&(
             <div style={{display:"flex",gap:5,alignItems:"center",marginLeft:"auto",paddingRight:20}}>
               {["all","hot","warm","cool","disqualified"].map(tf=>{
@@ -1230,8 +1600,7 @@ export default function SolarityAgent() {
                     background:filter===tf?(t2?.bg||"rgba(255,255,255,0.06)"):"transparent",
                     border:filter===tf?`1px solid ${t2?.border||"rgba(255,255,255,0.15)"}`:"1px solid transparent",
                     color:filter===tf?(t2?.color||"#E2E8F0"):"#2D3F52",
-                    fontSize:8,fontWeight:filter===tf?700:400,letterSpacing:"0.1em",textTransform:"uppercase",
-                  }}>
+                    fontSize:8,fontWeight:filter===tf?700:400,letterSpacing:"0.1em",textTransform:"uppercase"}}>
                     {tf==="all"?`ALL ${cnt}`:`${t2?.label||tf} ${cnt}`}
                   </button>
                 );
@@ -1240,33 +1609,27 @@ export default function SolarityAgent() {
           )}
         </div>
 
+        {/* Content */}
         <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
           {tab==="results"?(
             filtered.length>0?(
               <div style={{flex:1,overflowY:"auto",padding:"16px 20px"}}>
                 {filtered.map((p,i)=>(
                   <div key={p.co.name+i} className="fu" style={{animationDelay:`${i*0.03}s`}}>
-                    <ProspectCard p={p} idx={i} onEnrich={manualEnrich}/>
+                    <ProspectCard p={p} idx={i} onEnrich={manualEnrich} country={cfg.country}/>
                   </div>
                 ))}
               </div>
             ):(
-              <div style={{
-                flex:1,display:"flex",flexDirection:"column",
-                alignItems:"center",justifyContent:"center",gap:14,
-              }}>
+              <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14}}>
                 <div style={{fontSize:52,opacity:0.05}}>☀</div>
                 <div style={{fontSize:10,color:"#1E293B",letterSpacing:"0.2em",textTransform:"uppercase"}}>
                   {running?"Pipeline running - results appear live":"Select sectors and run the pipeline"}
                 </div>
-                {!running&&(
-                  <div style={{fontSize:10,color:"#1E293B",maxWidth:360,textAlign:"center",lineHeight:1.7}}>
-                    Choose a country, select target sectors, set your minimum load threshold, then hit Run Pipeline.
-                    Gemini will discover candidates, Claude will score them, and contacts will be enriched automatically.
-                  </div>
-                )}
               </div>
             )
+          ):tab==="learning"?(
+            <LearningDashboard onTrain={trainAgent} training={training}/>
           ):(
             <div style={{flex:1,padding:"16px 20px",overflow:"auto"}}>
               <PipelineLog entries={logEntries}/>
